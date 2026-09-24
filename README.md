@@ -75,6 +75,65 @@ docker compose up --build
   提高 `max_disabled` 后可能变为可行；可行解的停用数只取决于数据，不会因放宽上限而多停载频。
 - 分析不存在 → `404`；无违规产物 → 任意上限都返回 `feasible=true` 与空集合。
 
+## 现场复测窗口规划（scan windows）
+
+`GET /analyses/{analysis_id}/scan-windows?width_hz=w&max_windows=k` 基于**已保存
+分析的违规产物频率**规划现场复测窗口，**只读已持久化结果，不重新扫描**。查询参数
+`width_hz` 为**正整数**，`max_windows` 为 **1～3 的整数**（缺失、越界、非正或非整数
+→ `422`；`width_hz` 超过扫描范围长度 `scan_end_hz - scan_start_hz` → `422`；
+分析不存在 → `404`）。
+
+- **窗口定义**：每个窗口是该分析所属站点扫描范围 `[scan_start_hz, scan_end_hz]`
+  内**长度恰为 `width_hz`** 的整数 Hz 闭区间 `[start_hz, start_hz + width_hz]`
+  （故 `end_hz - start_hz = width_hz`，窗口含 `width_hz + 1` 个整数频点）。
+- **互不重叠**：窗口闭区间互不相交，任意两窗不共享整数频点，相邻窗口起点至少相差
+  `width_hz + 1`（即前窗终点 `<` 后窗起点，至少间隔 1 Hz）。
+- **优化目标（严格按序）**：
+  1. 窗口覆盖的**不同违规产物频率数**最多；
+  2. 覆盖数并列时取**窗口数更少**者；
+  3. 仍并列时取**升序起点列表字典序最小**者（窗口整体尽量靠左，结果稳定可复现）。
+- **精确算法（不遍历整个 Hz 范围）**：先按频率排序违规点；再枚举全部可能进入最优解的
+  窗口起点——扫描边界点与每个违规频率（窗口左/右端贴住违规点两种锚定）在
+  “链式推移格点” `a + q·(width_hz+1)`（`q ∈ {-2,…,2}`，覆盖至多三窗的首尾相触链）
+  上的投影，候选总数与违规频率数线性相关、与扫描范围 Hz 跨度无关；最后在排序候选上做
+  加权区间调度式**动态规划**（双指针维护不相交前驱前缀的最优状态，覆盖数用排序点列上的
+  下标区间计算，O(K·n)）。覆盖数/窗口数并列时的字典序决胜沿父指针逐层比较，无遗漏。
+- **响应**：`windows` 按起点升序给出每窗起止与该窗覆盖的违规频率；
+  `covered_freqs_hz` 为全部窗口覆盖的违规频率并集，`uncovered_freqs_hz` 为仍未覆盖的
+  违规频率（均升序）。该分析**无违规产物时返回空窗口**（200，`windows=[]`，
+  覆盖/未覆盖均为空）；窗口数少于 `max_windows` 时按实际最优窗口数返回。
+
+请求与响应示例（载频 `[100, 300, 400]`、扫描范围 `[1, 10000]` 的分析，违规产物为
+200 与 500 Hz；`width_hz=299` 时单窗无法同时覆盖，需两个首尾相触的窗口；
+字典序最优把窗口尽量左移到扫描边界）：
+
+```bash
+curl 'http://localhost:8000/analyses/1/scan-windows?width_hz=299&max_windows=2'
+```
+
+```json
+{
+  "analysis_id": 1,
+  "site_id": 1,
+  "scan_start_hz": 1,
+  "scan_end_hz": 10000,
+  "width_hz": 299,
+  "max_windows": 2,
+  "window_count": 2,
+  "violation_count": 2,
+  "windows": [
+    {"start_hz": 1, "end_hz": 300, "covered_freqs_hz": [200]},
+    {"start_hz": 301, "end_hz": 600, "covered_freqs_hz": [500]}
+  ],
+  "covered_freqs_hz": [200, 500],
+  "uncovered_freqs_hz": []
+}
+```
+
+窗口宽度达到 300 时单个窗口 `[200, 500]` 即可覆盖全部两个违规点，覆盖数并列下优先返回
+窗口数更少的单窗方案；`width_hz=9999`（恰为扫描范围跨度 9999 Hz）时唯一合法窗口为
+`[1, 10000]`，`width_hz=10000` 超过跨度返回 `422`。
+
 ## 新增载频禁用区间（carrier exclusion ranges）
 
 `GET /sites/{site_id}/carrier-exclusion-ranges?candidate_start_hz=a&candidate_end_hz=b`
@@ -530,6 +589,7 @@ curl 'http://localhost:8000/sites/1/risk-history?limit=10'
 | `GET` | `/analyses/{analysis_id}` | 按 id 查询已保存的分析结果 |
 | `GET` | `/analyses/{analysis_id}/risk-groups` | 按已保存分析结果生成风险分组（违规产物 ↔ 来源载频的二部图连通分量） |
 | `GET` | `/analyses/{analysis_id}/mitigation-plan?max_disabled=k` | 按已保存分析结果求最小停用载频集合（精确最小点覆盖，`max_disabled` 取 1～8；上限内无解返回 `feasible=false` 与未消除产物频率） |
+| `GET` | `/analyses/{analysis_id}/scan-windows?width_hz=w&max_windows=k` | 基于已保存分析的违规频率规划现场复测窗口（定长不相交闭区间，覆盖数最大→窗口数最少→起点字典序；`width_hz` 正整数、`max_windows` 1～3；超宽 → 422，分析不存在 → 404，无违规返回空窗口） |
 | `POST` | `/cross-site-conflicts` | 跨站点冲突检测：2～8 个站点最近分析的近频产物配对，按连通分量聚合为冲突簇（站点不存在/无分析 → 404，参数非法 → 422） |
 
 ### 示例
@@ -577,6 +637,9 @@ curl http://localhost:8000/analyses/1/risk-groups
 
 # 求最小停用方案（最多停用 2 个载频；仅使用已保存的分析结果）
 curl 'http://localhost:8000/analyses/1/mitigation-plan?max_disabled=2'
+
+# 规划现场复测窗口（窗口长 299 Hz、至多 2 个，覆盖最多违规频率；只读已保存分析）
+curl 'http://localhost:8000/analyses/1/scan-windows?width_hz=299&max_windows=2'
 
 # 查询候选范围 [1, 10000] 内不宜新增载频的区间（不执行或保存分析）
 curl 'http://localhost:8000/sites/1/carrier-exclusion-ranges?candidate_start_hz=1&candidate_end_hz=10000'
@@ -665,8 +728,9 @@ curl -X POST http://localhost:8000/cross-site-conflicts \
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 
-# 运行测试（103 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
-# 新增载频禁用区间、单载频迁移规划、载频漂移风险评估、跨站点冲突检测，幂等键的重复重放、失败回滚与并发去重，
+# 运行测试（113 个用例，覆盖创建、校验拒绝、聚合、距离、持久化查询、风险分组、最小停用方案、
+# 新增载频禁用区间、单载频迁移规划、载频漂移风险评估、跨站点冲突检测、现场复测窗口规划
+# （含贴边格点链与字典序决胜），幂等键的重复重放、失败回滚与并发去重，
 # 多站点原子批量分析的顺序一致、404 整批不保存与失败整批回滚，
 # 分析历史保留清理的倒序保留、幂等键联动删除与整批回滚，
 # 以及站点历史风险的窗口选取、违规计数、连续计数终止与参数校验）
@@ -687,7 +751,7 @@ uvicorn app.main:app --reload
 ```
 app/
   main.py       # FastAPI 应用与路由，启动时初始化数据库（含单站分析与多站点原子批量分析、站点历史风险查询、单载频迁移规划）
-  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、单载频迁移规划（线性约束反解与禁用区间合并）、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合、站点历史风险汇总
+  analysis.py   # 三阶互调枚举、同频聚合、最近命中对象计算、风险分组（连通分量）、停用方案（精确最小点覆盖）、新增载频禁用区间反解、单载频迁移规划（线性约束反解与禁用区间合并）、载频漂移风险评估（共享变量区间）、跨站点冲突配对与连通分量聚合、站点历史风险汇总、现场复测窗口规划（格点候选 + 加权区间调度动态规划）
   database.py   # SQLite 建表与读写（单事务批量写入、幂等键原子登记与重放、多站点批量分析单事务提交、历史保留单事务清理、最近分析窗口读取、跨站点最近分析批量查询）
   schemas.py    # Pydantic 请求/响应模型与校验
 tests/

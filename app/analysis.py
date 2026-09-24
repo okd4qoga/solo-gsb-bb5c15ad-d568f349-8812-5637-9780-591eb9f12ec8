@@ -1,6 +1,7 @@
 """三阶互调产物分析：枚举 2*fa - fb，聚合来源并评估最近命中对象。"""
 from __future__ import annotations
 
+from bisect import bisect_left, bisect_right
 from typing import Sequence
 
 from .schemas import (
@@ -16,6 +17,8 @@ from .schemas import (
     ProductOut,
     RiskGroup,
     RiskHistoryEntry,
+    ScanWindow,
+    ScanWindowsResult,
     SourcePair,
 )
 
@@ -1033,3 +1036,212 @@ def build_cross_site_conflicts(
             )
         )
     return clusters
+
+
+def _scan_window_candidate_starts(
+    violation_freqs: Sequence[int], scan_start_hz: int, scan_end_hz: int, width_hz: int
+) -> list[int]:
+    """枚举全部可能出现在最优解中的窗口起点（整数 Hz），按升序去重。
+
+    候选起点来自扫描边界与每个违规频率 p 在“链式推移格点”上的投影：
+    `a + q*(width_hz+1)`（q 为小整数）。宽度为 w 的窗口闭区间互不相交时，
+    相邻起点至少相差 w+1；一组首尾相触的窗口起点必落在某个锚点的
+    a mod (w+1) 同余格点上，因此任何最优窗口族都可在不减少覆盖、不增加
+    窗口数的前提下整体平移到这些格点上（边界或违规频率阻止继续平移）。
+    max_windows 不超过 3，q ∈ {-2,…,2} 即足以覆盖三窗链的全部格点位置。
+
+    锚点取扫描起点 scan_start、右端贴边窗口起点 scan_end - w，以及每个违规
+    频率 p 的 p（窗口左端挡住左移）与 p - w（窗口右端 p 挡住左移）：在保持
+    覆盖数不减少的平移下，最优窗口族终态的起点必为 scan_start（贴左边界）、
+    (scan_end - w) - (t-1)(w+1)（贴右边界）、p - (t-1)(w+1)（左端为违规
+    频率）或 (p - w) - (t-1)(w+1)（右端为违规频率），t ≤ max_windows。
+    """
+    first = scan_start_hz
+    last = scan_end_hz - width_hz
+    step = width_hz + 1
+    anchors: list[int] = [scan_start_hz, scan_end_hz - width_hz]
+    anchors.extend(violation_freqs)
+    anchors.extend(p - width_hz for p in violation_freqs)
+    starts: set[int] = set()
+    for anchor in anchors:
+        for q in range(-2, 3):
+            start = anchor + q * step
+            if first <= start <= last:
+                starts.add(start)
+    return sorted(starts)
+
+
+def plan_scan_windows(
+    products: Sequence[ProductOut],
+    analysis_id: int,
+    site_id: int,
+    scan_start_hz: int,
+    scan_end_hz: int,
+    width_hz: int,
+    max_windows: int,
+) -> ScanWindowsResult:
+    """基于已保存分析的违规产物频率，精确规划至多 max_windows 个现场复测窗口。
+
+    每个窗口是扫描范围 [scan_start_hz, scan_end_hz] 内长度恰为 width_hz 的
+    整数 Hz 闭区间 [s, s + width_hz]，窗口闭区间互不相交（相邻窗口至少间隔
+    1 Hz）。仅读取分析结果中 violates_guard_interval 的不同产物频率，在
+    候选起点格点上做加权区间调度式动态规划，不逐 Hz 枚举扫描范围。
+
+    优化目标（字典序）：(覆盖的不同违规频率数, -窗口数, 升序起点取反) 取最大，
+    即覆盖数最多；并列取窗口数最少；再并列取升序起点列表字典序最小。
+    无违规产物时返回空窗口。
+    """
+    violations = sorted({p.freq_hz for p in products if p.violates_guard_interval})
+    empty_result = ScanWindowsResult(
+        analysis_id=analysis_id,
+        site_id=site_id,
+        scan_start_hz=scan_start_hz,
+        scan_end_hz=scan_end_hz,
+        width_hz=width_hz,
+        max_windows=max_windows,
+        window_count=0,
+        violation_count=len(violations),
+        windows=[],
+        covered_freqs_hz=[],
+        uncovered_freqs_hz=[],
+    )
+    if not violations:
+        return empty_result
+    starts = _scan_window_candidate_starts(
+        violations, scan_start_hz, scan_end_hz, width_hz
+    )
+
+    # 每个候选起点覆盖的违规频率（排序点列上的 [lo, hi) 下标）。starts 与
+    # violations 均升序，lo/hi 单调不减，双指针线性扫描避免逐候选二分。
+    cover_lo = [0] * len(starts)
+    cover_hi = [0] * len(starts)
+    lo_pt = hi_pt = 0
+    for j, start in enumerate(starts):
+        end = start + width_hz
+        while lo_pt < len(violations) and violations[lo_pt] < start:
+            lo_pt += 1
+        while hi_pt < len(violations) and violations[hi_pt] <= end:
+            hi_pt += 1
+        cover_lo[j] = lo_pt
+        cover_hi[j] = hi_pt
+
+    # 动态规划：第 k 层表示“恰选 k 个窗口”的方案，cur_cov[j]/cur_parent[j]
+    # 为以第 j 个候选窗口收尾时的最大覆盖数与其在第 k-1 层的收尾候选下标
+    # （首层父下标为 -1；覆盖数 0 表示该状态不存在）。合法前驱只取候选 j
+    # 左侧满足闭区间不相交的一个前缀，其最优状态随 j 双指针增量维护。
+    # 同一层窗口数固定，覆盖数并列时比较升序起点列表字典序；K ≤ 3，比较沿
+    # 父指针最多回溯 3 层，无逐候选元组分配。
+    n_candidates = len(starts)
+    prev_cov = [0] * n_candidates
+    prev_parents: list[int] | None = None  # 上一层的父指针数组（首层为 None）
+
+    def lex_less(layer: int, end_a: int, end_b: int,
+                 parents: list[int] | None) -> bool:
+        """同一层内两个等长（长度 = layer）方案的升序起点列表字典序：a < b？
+
+        方案以父指针链表自末位窗口向首位存储，parents 为本层父指针数组
+        （首层为 None），其各前驱层数组由 all_parents 提供。字典序由“自起点
+        第一个不同的位置”决定，等价于自末位回溯时遇到的最后一对不同的层：
+        末位不同则记录该对，再沿父指针比较前缀；父指针相同时更前起点完全一致。
+        """
+        # 两方案起点列表均按窗口顺序自末位存储，逐层收集后比较“最后一对不同”
+        # （即自起点起第一个不同的位置）
+        diff_a, diff_b = end_a, end_b
+        while layer > 1 and end_a != end_b:
+            diff_a, diff_b = end_a, end_b
+            assert parents is not None
+            end_a = parents[end_a]
+            end_b = parents[end_b]
+            layer -= 1
+            parents = all_parents[layer]
+        if end_a != end_b:
+            diff_a, diff_b = end_a, end_b  # 到达首层且首层不同
+        return starts[diff_a] < starts[diff_b]
+
+    # all_parents[k]：第 k+1 层（0 基）状态的父指针数组；首层为 None 占位。
+    all_parents: list[list[int] | None] = [None]
+    # 全局最优：覆盖数、窗口数（越少越优）、收尾候选下标（所在层即窗口数）
+    g_cov, g_k, g_end = 0, 0, -1
+
+    for k in range(1, max_windows + 1):
+        cur_cov = [0] * n_candidates
+        cur_parent = [-1] * n_candidates
+        # 合法前驱前缀（prev 起点 <= starts[j] - w - 1，闭区间不相交且至少
+        # 间隔 1 Hz）的右端点随 j 单调右移；前缀最优仅保留一个状态，
+        # 尚未见到可行前驱时 have_prefix=False
+        i_end = -1
+        p_cov, p_end = 0, -1
+        have_prefix = False
+        for j in range(n_candidates):
+            gain = cover_hi[j] - cover_lo[j]
+            if gain == 0:
+                continue  # 不覆盖任何违规频率的窗口不会进入最优解
+            if k == 1:
+                count, parent = gain, -1
+            else:
+                limit = starts[j] - width_hz - 1
+                while i_end + 1 < j and starts[i_end + 1] <= limit:
+                    i_end += 1
+                    cc = prev_cov[i_end]
+                    if cc == 0:
+                        continue  # 上一层不存在以该候选收尾的方案，不延续前缀最优
+                    if not have_prefix or cc > p_cov or (
+                        cc == p_cov
+                        and lex_less(k - 1, i_end, p_end, prev_parents)
+                    ):
+                        p_cov, p_end, have_prefix = cc, i_end, True
+                if not have_prefix:
+                    continue  # 无法在不相交前提下选出 k-1 个前驱窗口
+                # 前驱与本窗闭区间不相交，覆盖点集不重合，覆盖数直接相加
+                count, parent = p_cov + gain, p_end
+            cur_cov[j] = count
+            cur_parent[j] = parent
+            # 与全局最优比较：覆盖数优先，其次窗口数少，最后起点字典序小
+            if count > g_cov or (
+                count == g_cov
+                and (
+                    k < g_k
+                    or (k == g_k and g_end >= 0 and lex_less(k, j, g_end, cur_parent))
+                )
+            ):
+                g_cov, g_k, g_end = count, k, j
+        all_parents.append(cur_parent)
+        prev_cov = cur_cov
+        prev_parents = cur_parent
+
+    # 沿父指针重建全局最优的升序起点列表
+    chosen_starts: list[int] = []
+    if g_k > 0:
+        layer, end = g_k, g_end
+        while layer >= 1:
+            chosen_starts.append(starts[end])
+            if layer == 1:
+                break
+            parents = all_parents[layer]
+            assert parents is not None
+            end = parents[end]
+            layer -= 1
+        chosen_starts.reverse()
+    windows: list[ScanWindow] = []
+    covered: set[int] = set()
+    for start in chosen_starts:
+        end = start + width_hz
+        lo = bisect_left(violations, start)
+        hi = bisect_right(violations, end)
+        freqs = violations[lo:hi]
+        windows.append(ScanWindow(start_hz=start, end_hz=end, covered_freqs_hz=freqs))
+        covered.update(freqs)
+    uncovered = [f for f in violations if f not in covered]
+    return ScanWindowsResult(
+        analysis_id=analysis_id,
+        site_id=site_id,
+        scan_start_hz=scan_start_hz,
+        scan_end_hz=scan_end_hz,
+        width_hz=width_hz,
+        max_windows=max_windows,
+        window_count=len(windows),
+        violation_count=len(violations),
+        windows=windows,
+        covered_freqs_hz=sorted(covered),
+        uncovered_freqs_hz=uncovered,
+    )

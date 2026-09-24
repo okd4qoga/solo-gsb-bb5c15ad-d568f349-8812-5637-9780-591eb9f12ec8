@@ -16,6 +16,7 @@ from .analysis import (
     carrier_exclusion_ranges,
     carrier_relocation,
     drift_risk_assessment,
+    plan_scan_windows,
 )
 from .schemas import (
     AnalysisMeta,
@@ -33,6 +34,7 @@ from .schemas import (
     RetentionResult,
     RiskGroup,
     RiskHistoryEntry,
+    ScanWindowsResult,
     SiteAnalysisRef,
     SiteCreate,
     SiteOut,
@@ -487,6 +489,54 @@ def get_mitigation_plan(
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
     return build_mitigation_plan(result.products, analysis_id, max_disabled)
+
+
+@app.get(
+    "/analyses/{analysis_id}/scan-windows",
+    response_model=ScanWindowsResult,
+    tags=["analysis"],
+    summary="基于已保存分析的违规产物频率规划现场复测窗口",
+    description=(
+        "仅使用已持久化的分析结果，不重新扫描。每个窗口是该分析所属站点扫描范围"
+        "[scan_start_hz, scan_end_hz] 内**长度恰为 width_hz** 的整数 Hz 闭区间"
+        "[start_hz, start_hz + width_hz]，窗口闭区间互不相交（相邻窗口至少间隔 "
+        "1 Hz）。在至多 max_windows（1～3）个窗口的限制下，使覆盖的**不同违规"
+        "产物频率数**最大；覆盖数并列时取窗口数更少者，再并列时取升序起点列表"
+        "**字典序最小**者。返回各窗口起止与其覆盖的违规频率，以及总体覆盖与"
+        "未覆盖频率；该分析无违规产物时返回空窗口（200）。采用候选格点排序与"
+        "加权区间调度动态规划精确求解，不逐 Hz 遍历扫描范围。"
+        "width_hz 为正整数、max_windows 为 1～3 的整数（缺失、越界或非整数 → 422）；"
+        "width_hz 超过扫描范围长度（scan_end_hz - scan_start_hz）→ 422；"
+        "分析不存在 → 404。"
+    ),
+)
+def get_scan_windows(
+    analysis_id: int,
+    width_hz: int = Query(..., gt=0, description="窗口长度（end_hz - start_hz），正整数 Hz"),
+    max_windows: int = Query(
+        ..., ge=1, le=3, description="允许选择的最大窗口数，取 1～3 的整数"
+    ),
+) -> ScanWindowsResult:
+    result = database.fetch_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
+    site = database.fetch_site(result.site_id)
+    assert site is not None  # 外键约束下已保存分析必属于一个存在的站点
+    scan_span = site.scan_end_hz - site.scan_start_hz
+    if width_hz > scan_span:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"width_hz {width_hz} must not exceed scan range span ({scan_span} Hz)",
+        )
+    return plan_scan_windows(
+        products=result.products,
+        analysis_id=analysis_id,
+        site_id=site.id,
+        scan_start_hz=site.scan_start_hz,
+        scan_end_hz=site.scan_end_hz,
+        width_hz=width_hz,
+        max_windows=max_windows,
+    )
 
 
 @app.post(
