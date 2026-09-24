@@ -188,6 +188,39 @@ class MitigationPlan(BaseModel):
     )
 
 
+class ScanWindow(BaseModel):
+    """一个现场复测扫描窗口：扫描范围内长度恰为 width_hz 个整数 Hz 点的闭区间。"""
+
+    window_id: int = Field(..., description="窗口编号：按起点升序从 1 连续编号")
+    start_hz: int = Field(..., description="窗口起点（含），整数 Hz")
+    end_hz: int = Field(..., description="窗口终点（含），整数 Hz；end_hz - start_hz + 1 恰为 width_hz")
+    covered_violation_freqs_hz: list[int] = Field(
+        ..., description="该窗口覆盖的违规产物频率，升序"
+    )
+
+
+class ScanWindowsResult(BaseModel):
+    """现场复测窗口规划：在扫描范围内选择至多 max_windows 个互不重叠、长度恰为
+    width_hz 的整数 Hz 闭区间，使覆盖的不同违规产物频率数最大。"""
+
+    analysis_id: int
+    site_id: int
+    scan_start_hz: int = Field(..., description="站点扫描范围起点（含），整数 Hz")
+    scan_end_hz: int = Field(..., description="站点扫描范围终点（含），整数 Hz")
+    width_hz: int = Field(..., description="每个窗口覆盖的整数 Hz 点数（正整数）")
+    max_windows: int = Field(..., description="允许的窗口数上限（1～3）")
+    window_count: int = Field(..., description="实际选取的窗口数（并列时取窗口数更少者，可为 0）")
+    windows: list[ScanWindow] = Field(
+        ..., description="选取的窗口，按起点升序；无违规产物时为空列表"
+    )
+    covered_violation_freqs_hz: list[int] = Field(
+        ..., description="全部窗口覆盖的不同违规产物频率（升序去重）"
+    )
+    uncovered_violation_freqs_hz: list[int] = Field(
+        ..., description="未被任何窗口覆盖的违规产物频率（升序）"
+    )
+
+
 class ExclusionRange(BaseModel):
     """一段不宜新增载频的闭区间 [start_hz, end_hz]（整数 Hz）。"""
 

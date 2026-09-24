@@ -2229,3 +2229,305 @@ def test_build_risk_history_treats_absent_product_as_streak_break():
     ]
     assert build_risk_history([]) == []
 
+
+# ---------------------------------------------------------------- 现场复测扫描窗口
+
+def _set_analysis_violating_freqs(client, analysis_id, freqs):
+    """把已保存分析的产物改写为给定违规频率（测试构造违规形态，不经过分析计算）。"""
+    products = [
+        {
+            "freq_hz": f,
+            "distance_hz": 0,
+            "hit": {"type": "carrier", "carrier_hz": f, "guard_band": None},
+            "violates_guard_interval": True,
+            "sources": [{"fa_hz": f, "fb_hz": f + 1}],
+        }
+        for f in freqs
+    ]
+    _set_analysis_products(client, analysis_id, products)
+
+
+def test_scan_windows_single_window_max_coverage(client):
+    # 违规 200、500；宽 301 一个窗口 [200,500] 可同时覆盖二者（闭区间长度恰 301 点）
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 301, "max_windows": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "analysis_id": analysis_id,
+        "site_id": 1,
+        "scan_start_hz": 1,
+        "scan_end_hz": 10000,
+        "width_hz": 301,
+        "max_windows": 1,
+        "window_count": 1,
+        "windows": [
+            {
+                "window_id": 1,
+                "start_hz": 200,
+                "end_hz": 500,
+                "covered_violation_freqs_hz": [200, 500],
+            }
+        ],
+        "covered_violation_freqs_hz": [200, 500],
+        "uncovered_violation_freqs_hz": [],
+    }
+
+
+def test_scan_windows_tie_lexicographic_smallest_start(client):
+    # 宽 300 时单窗口无法同时覆盖 200 与 500（[201,500] 长度 300 但起点 201 时
+    # 不含 200）：覆盖数并列（均为 1），取起点列表字典序最小者 -> [1,300]
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 300, "max_windows": 1},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["window_count"] == 1
+    assert body["windows"] == [
+        {"window_id": 1, "start_hz": 1, "end_hz": 300,
+         "covered_violation_freqs_hz": [200]}
+    ]
+    assert body["covered_violation_freqs_hz"] == [200]
+    assert body["uncovered_violation_freqs_hz"] == [500]
+
+
+def test_scan_windows_multiple_non_overlapping(client):
+    # 宽 300、上限 2：两个不重叠窗口 [1,300]、[301,600] 覆盖 200 与 500
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 300, "max_windows": 2},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["window_count"] == 2
+    assert [(w["start_hz"], w["end_hz"]) for w in body["windows"]] == [
+        (1, 300),
+        (301, 600),
+    ]
+    assert body["windows"][0]["covered_violation_freqs_hz"] == [200]
+    assert body["windows"][1]["covered_violation_freqs_hz"] == [500]
+    assert body["covered_violation_freqs_hz"] == [200, 500]
+    assert body["uncovered_violation_freqs_hz"] == []
+    # 窗口均为恰 width_hz 个整数 Hz 点的闭区间且互不重叠
+    for w in body["windows"]:
+        assert w["end_hz"] - w["start_hz"] + 1 == 300
+
+
+def test_scan_windows_fewer_windows_preferred_on_tie(client):
+    # 上限 3 但 2 个窗口已覆盖全部违规：并列先取窗口数少者，返回 2 个窗口
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    body = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 300, "max_windows": 3},
+    ).json()
+    assert body["window_count"] == 2
+    assert len(body["windows"]) == 2
+    assert body["uncovered_violation_freqs_hz"] == []
+
+
+def test_scan_windows_empty_when_no_violation(client):
+    # guard_interval_hz=0：无违规产物 -> 空窗口（200）
+    client.post("/sites", json=make_payload(guard_interval_hz=0))
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    resp = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 100, "max_windows": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "analysis_id": analysis_id,
+        "site_id": 1,
+        "scan_start_hz": 1,
+        "scan_end_hz": 10000,
+        "width_hz": 100,
+        "max_windows": 3,
+        "window_count": 0,
+        "windows": [],
+        "covered_violation_freqs_hz": [],
+        "uncovered_violation_freqs_hz": [],
+    }
+
+
+def test_scan_windows_404_missing_analysis(client):
+    resp = client.get(
+        "/analyses/999/scan-windows", params={"width_hz": 10, "max_windows": 1}
+    )
+    assert resp.status_code == 404
+
+
+def test_scan_windows_422_param_validation(client):
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    url = f"/analyses/{analysis_id}/scan-windows"
+    # 缺少必填参数 -> 422
+    assert client.get(url).status_code == 422
+    assert client.get(url, params={"width_hz": 100}).status_code == 422
+    assert client.get(url, params={"max_windows": 1}).status_code == 422
+    # width_hz 非正整数 / 非整数 -> 422
+    for bad in (0, -1, "x", 1.5):
+        assert client.get(
+            url, params={"width_hz": bad, "max_windows": 1}
+        ).status_code == 422, bad
+    # max_windows 越界（0、4）/ 非整数 -> 422
+    for bad in (0, 4, -1, "x", 1.5):
+        assert client.get(
+            url, params={"width_hz": 100, "max_windows": bad}
+        ).status_code == 422, bad
+    # 边界值 max_windows 1～3 合法
+    for k in (1, 2, 3):
+        assert client.get(
+            url, params={"width_hz": 100, "max_windows": k}
+        ).status_code == 200
+
+
+def test_scan_windows_422_width_exceeds_scan_range(client):
+    # 默认扫描范围 [1,10000] 共 10000 个整数 Hz 点：width_hz=10000 合法（窗口
+    # 恰好覆盖整个扫描范围），10001 超过扫描范围 -> 422
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    url = f"/analyses/{analysis_id}/scan-windows"
+    ok = client.get(url, params={"width_hz": 10000, "max_windows": 1})
+    assert ok.status_code == 200
+    win = ok.json()["windows"][0]
+    assert (win["start_hz"], win["end_hz"]) == (1, 10000)
+
+    too_wide = client.get(url, params={"width_hz": 10001, "max_windows": 1})
+    assert too_wide.status_code == 422
+    assert "width_hz" in too_wide.json()["detail"]
+
+
+def test_scan_windows_read_only_uses_persisted_result(client):
+    # 仅使用已保存结果：改写持久化产物后规划随之改变，且不产生新分析；
+    # 同一 analysis_id 重复查询结果一致。
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    _set_analysis_violating_freqs(client, analysis_id, [100, 1000, 5000])
+    body = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 50, "max_windows": 3},
+    ).json()
+    assert body["covered_violation_freqs_hz"] == [100, 1000, 5000]
+    assert [(w["start_hz"], w["end_hz"]) for w in body["windows"]] == [
+        (51, 100),
+        (951, 1000),
+        (4951, 5000),
+    ]
+    again = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 50, "max_windows": 3},
+    ).json()
+    assert again == body
+    # 只读：分析记录数不变
+    assert len(client.get("/sites/1/analyses").json()) == 1
+
+
+def test_scan_windows_right_edge_clipping(client):
+    # 违规频率贴近扫描右界：窗口起点被 max_start=scan_end-width+1 截断
+    client.post("/sites", json=make_payload())
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    _set_analysis_violating_freqs(client, analysis_id, [9990, 10000])
+    body = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 100, "max_windows": 2},
+    ).json()
+    # 单窗口 [9901,10000] 即可同时覆盖二者，窗口数更少 -> 只返回 1 个
+    assert body["window_count"] == 1
+    assert body["windows"][0] == {
+        "window_id": 1,
+        "start_hz": 9901,
+        "end_hz": 10000,
+        "covered_violation_freqs_hz": [9990, 10000],
+    }
+    assert body["covered_violation_freqs_hz"] == [9990, 10000]
+    assert body["uncovered_violation_freqs_hz"] == []
+
+
+def test_scan_windows_narrow_scan_range(client):
+    # 窄扫描范围 [5,9]（5 个整数点），违规 {5,9}，宽 3：任意两个合法窗口
+    # （起点 5/6/7）中起点 5 与 7 的窗口 [5,7]、[7,9] 在 7 处重叠，故上限 2
+    # 也只能覆盖一个违规点；覆盖数、窗口数并列时取起点字典序最小 -> 单窗 [5,7]。
+    client.post(
+        "/sites",
+        json=make_payload(scan_start_hz=5, scan_end_hz=9),
+    )
+    analysis_id = client.post("/sites/1/analysis").json()["analysis_id"]
+    _set_analysis_violating_freqs(client, analysis_id, [5, 9])
+    body = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 3, "max_windows": 2},
+    ).json()
+    assert body["scan_start_hz"] == 5 and body["scan_end_hz"] == 9
+    assert body["window_count"] == 1
+    assert body["windows"] == [
+        {"window_id": 1, "start_hz": 5, "end_hz": 7,
+         "covered_violation_freqs_hz": [5]}
+    ]
+    assert body["covered_violation_freqs_hz"] == [5]
+    assert body["uncovered_violation_freqs_hz"] == [9]
+    # width 超过扫描范围点数（5）-> 422
+    resp = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 6, "max_windows": 1},
+    )
+    assert resp.status_code == 422
+    # width 恰好等于扫描范围点数合法：单窗 [5,9] 覆盖全部违规
+    full = client.get(
+        f"/analyses/{analysis_id}/scan-windows",
+        params={"width_hz": 5, "max_windows": 1},
+    ).json()
+    assert full["windows"] == [
+        {"window_id": 1, "start_hz": 5, "end_hz": 9,
+         "covered_violation_freqs_hz": [5, 9]}
+    ]
+
+
+def test_build_scan_windows_unit_matches_exact_optimum():
+    # 直接对规划函数建模，覆盖右界截断 + 字典序并列的一个手工实例：
+    # 扫描 [5,13]（9 点），违规 {8,10,11}，宽 5，上限 1。
+    # 窗口 [7,11] 覆盖全部 3 个违规频率，为最优单窗口。
+    from app.analysis import build_scan_windows
+    from app.schemas import AnalysisResult, ProductOut
+
+    def product(freq):
+        return ProductOut(
+            freq_hz=freq,
+            distance_hz=0,
+            hit={"type": "carrier", "carrier_hz": freq, "guard_band": None},
+            violates_guard_interval=True,
+            sources=[{"fa_hz": freq, "fb_hz": freq + 1}],
+        )
+
+    result = AnalysisResult(
+        analysis_id=7,
+        site_id=3,
+        created_at="2026-01-01T00:00:00.000Z",
+        product_count=3,
+        products=[product(8), product(10), product(11)],
+    )
+    plan = build_scan_windows(result, 5, 13, 5, 1)
+    assert plan.window_count == 1
+    assert plan.windows[0].start_hz == 7
+    assert plan.windows[0].end_hz == 11
+    assert plan.windows[0].covered_violation_freqs_hz == [8, 10, 11]
+    assert plan.covered_violation_freqs_hz == [8, 10, 11]
+    assert plan.uncovered_violation_freqs_hz == []
+
+    # 无违规：空窗口
+    empty = AnalysisResult(
+        analysis_id=8,
+        site_id=3,
+        created_at="2026-01-01T00:00:00.000Z",
+        product_count=0,
+        products=[],
+    )
+    assert build_scan_windows(empty, 5, 13, 5, 3).window_count == 0
+

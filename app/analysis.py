@@ -16,6 +16,8 @@ from .schemas import (
     ProductOut,
     RiskGroup,
     RiskHistoryEntry,
+    ScanWindow,
+    ScanWindowsResult,
     SourcePair,
 )
 
@@ -921,6 +923,167 @@ def drift_risk_assessment(
             )
     entries.sort(key=lambda e: (e.nominal_freq_hz, e.source.fa_hz, e.source.fb_hz))
     return entries
+
+
+def build_scan_windows(
+    result: AnalysisResult,
+    scan_start_hz: int,
+    scan_end_hz: int,
+    width_hz: int,
+    max_windows: int,
+) -> ScanWindowsResult:
+    """基于已保存分析的违规产物频率规划现场复测扫描窗口（精确最优）。
+
+    每个窗口是扫描范围 [scan_start_hz, scan_end_hz] 内长度恰为 width_hz 个
+    整数 Hz 点的闭区间 [start, start + width_hz - 1]，窗口互不重叠（整数
+    闭区间不相交即后一窗口起点 > 前一窗口终点）。在至多 max_windows 个窗口
+    的约束下，使覆盖的不同违规产物（violates_guard_interval=true）频率数
+    最大；覆盖数并列时取窗口数更少者，再并列时按窗口起点升序列表的字典序
+    取小。
+
+    精确求解（排序 + 动态规划，不遍历 Hz 范围）。固定各窗口的覆盖分组后，把
+    窗口从左到右压到“极左”位置：窗口 j 起点取下述三者的最大值——扫描左界、
+    其最右覆盖违规频率 f 的右锚点 f-width+1（保证 f 不丢）、左邻窗口终点 +1
+    （保证不重叠）。展开至多 max_windows(≤3) 个窗口后，起点只可能为：
+    窗口最左覆盖违规频率的左锚点 min(f, max_start)（无紧密左邻、未被右锚点
+    约束时）、右锚点 max(scan_start, f-width+1) 加 d·width（d 为紧密相邻的
+    前序窗口数，0～2），以及扫描边界本身及其紧密相邻位置
+    scan_start+d·width 与 max_start-d·width（边界截断窗口的相邻打包）。
+    候选按起点排序去重后，用“至多 k 个互不重叠权值区间”的动态规划求解，
+    每个候选的覆盖频率段与不重叠前驱都在排序序列上以双指针定位，状态按覆盖
+    数、窗口数、起点字典序逐维裁决（长链仅存回溯指针，避免复制起点列表），
+    复杂度 O(n log n + k·m)，n 为违规频率数、m ≤ 5n+6 为候选数。
+    """
+    violations = sorted(
+        {p.freq_hz for p in result.products if p.violates_guard_interval}
+    )
+    max_start = scan_end_hz - width_hz + 1
+
+    # 极左候选起点：扫描边界（含被边界截断窗口的紧密相邻位置 scan_start+d*width）
+    # + 左锚点 min(f, max_start)
+    # + 右锚点 max(scan_start, f-width+1) 及其紧密相邻（+d*width）位置
+    right_anchors = [max(scan_start_hz, f - width_hz + 1) for f in violations]
+    starts_set = {
+        scan_start_hz + d * width_hz
+        for d in range(max_windows)
+        if scan_start_hz + d * width_hz <= max_start
+    }
+    starts_set.update(
+        max_start - d * width_hz
+        for d in range(max_windows)
+        if max_start - d * width_hz >= scan_start_hz
+    )
+    starts_set.update(min(freq, max_start) for freq in violations)
+    for d in range(max_windows):
+        starts_set.update(
+            anchor + d * width_hz
+            for anchor in right_anchors
+            if anchor + d * width_hz <= max_start
+        )
+    starts = sorted(starts_set)
+    ends = [start + width_hz - 1 for start in starts]
+
+    # 每个候选窗口覆盖的违规频率（切片均为 violations 升序列表的连续段）；
+    # starts、ends 均升序，用双指针一次扫完，避免每候选二分（O(n+m)）。
+    covered_slices: list[tuple[int, int]] = []
+    lo = hi = 0
+    for start, end in zip(starts, ends):
+        while lo < len(violations) and violations[lo] < start:
+            lo += 1
+        while hi < len(violations) and violations[hi] <= end:
+            hi += 1
+        covered_slices.append((lo, hi))
+    counts = [hi - lo for lo, hi in covered_slices]
+
+    # 前驱：在起点升序的候选序列中，终点严格小于本窗口起点（不重叠）的
+    # 最后一个候选的序号；ends 随 starts 单调不减，双指针一次扫完。
+    prev: list[int] = []
+    p = 0
+    for start in starts:
+        while p < len(ends) and ends[p] < start:
+            p += 1
+        prev.append(p)
+
+    # 至多 k 个互不重叠权值区间的动态规划。dp[k][i] 表示仅用前 i 个候选、
+    # 至多 k 个窗口时的最优状态。状态用不可变“选择节点”元组表示：
+    #   (覆盖数, 窗口数, 首候选序号, 取窗回溯信息)
+    # 取窗时回溯信息为 (前驱行对应节点, 本候选序号)，skip 时直接复用本行前格
+    # 节点（跨行共享不可变节点安全）。裁决顺序：覆盖数最大 -> 窗口数最少 ->
+    # 起点升序列表字典序最小。前两项用整数比较快速完成，仅在二者都并列时才沿
+    # 回溯链取出起点元组做字典序比较——最优链至多含 max_windows(≤3) 个候选，
+    # 比较为 O(k)，而候选数可达数万，绝不能在每格保存/复制完整起点元组（否则
+    # 退化为 O(n^2)）。回溯链保证整体 O(k·m)。
+    m = len(starts)
+    SENTINEL = -1
+    empty_node = (0, 0, SENTINEL, None)
+
+    def node_starts(node) -> tuple[int, ...]:
+        """沿取窗回溯链取出该节点选择的全部窗口起点（升序）。链长 ≤ max_windows。"""
+        out: list[int] = []
+        while node[2] != SENTINEL:
+            base, cand_idx = node[3]
+            out.append(starts[cand_idx])
+            node = base
+        return tuple(reversed(out))
+
+    row = [empty_node] * (m + 1)
+    for _ in range(max_windows):
+        nxt = [empty_node]
+        for i in range(1, m + 1):
+            skip = nxt[i - 1]
+            base = row[prev[i - 1]]
+            cand_idx = i - 1
+            take = (
+                base[0] + counts[cand_idx],  # 前驱窗口与本窗口不相交，覆盖集不交
+                base[1] + 1,
+                cand_idx if base[2] == SENTINEL else base[2],
+                (base, cand_idx),
+            )
+            t_cov, s_cov = take[0], skip[0]
+            if t_cov != s_cov:
+                take_better = t_cov > s_cov
+            else:
+                t_cnt, s_cnt = take[1], skip[1]
+                if t_cnt != s_cnt:
+                    take_better = t_cnt < s_cnt
+                else:
+                    # 覆盖数、窗口数均并列：沿回溯链取起点元组比字典序（链长 ≤ 3）
+                    take_better = node_starts(take) < node_starts(skip)
+            nxt.append(take if take_better else skip)
+        row = nxt
+
+    chosen_starts = node_starts(row[m])
+    index_of = {start: i for i, start in enumerate(starts)}
+    windows: list[ScanWindow] = []
+    covered_set: set[int] = set()
+    for window_id, start in enumerate(chosen_starts, start=1):
+        i = index_of[start]
+        end = ends[i]
+        lo, hi = covered_slices[i]
+        freqs = violations[lo:hi]
+        covered_set.update(freqs)
+        windows.append(
+            ScanWindow(
+                window_id=window_id,
+                start_hz=start,
+                end_hz=end,
+                covered_violation_freqs_hz=freqs,
+            )
+        )
+    covered = sorted(covered_set)
+    uncovered = [f for f in violations if f not in covered_set]
+    return ScanWindowsResult(
+        analysis_id=result.analysis_id,
+        site_id=result.site_id,
+        scan_start_hz=scan_start_hz,
+        scan_end_hz=scan_end_hz,
+        width_hz=width_hz,
+        max_windows=max_windows,
+        window_count=len(windows),
+        windows=windows,
+        covered_violation_freqs_hz=covered,
+        uncovered_violation_freqs_hz=uncovered,
+    )
 
 
 def build_cross_site_conflicts(

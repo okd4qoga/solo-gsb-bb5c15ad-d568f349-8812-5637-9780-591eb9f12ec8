@@ -13,6 +13,7 @@ from .analysis import (
     build_mitigation_plan,
     build_risk_groups,
     build_risk_history,
+    build_scan_windows,
     carrier_exclusion_ranges,
     carrier_relocation,
     drift_risk_assessment,
@@ -33,6 +34,7 @@ from .schemas import (
     RetentionResult,
     RiskGroup,
     RiskHistoryEntry,
+    ScanWindowsResult,
     SiteAnalysisRef,
     SiteCreate,
     SiteOut,
@@ -487,6 +489,50 @@ def get_mitigation_plan(
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
     return build_mitigation_plan(result.products, analysis_id, max_disabled)
+
+
+@app.get(
+    "/analyses/{analysis_id}/scan-windows",
+    response_model=ScanWindowsResult,
+    tags=["analysis"],
+    summary="基于已保存分析的违规产物频率规划现场复测扫描窗口",
+    description=(
+        "仅使用已持久化的分析结果，不重新扫描。每个窗口是站点扫描范围内长度恰为 "
+        "width_hz 个整数 Hz 点的闭区间 [start_hz, end_hz]（end_hz - start_hz + 1 "
+        "= width_hz），窗口互不重叠。选择至多 max_windows 个窗口，使覆盖的不同违规"
+        "产物频率数最大；覆盖数并列时先取窗口数更少者，再并列时按窗口起点升序列表的"
+        "字典序取小。服务端以排序 + 动态规划精确求解（候选窗口仅锚定违规频率，"
+        "不遍历整个 Hz 范围），返回各窗口起止与覆盖的违规频率，以及总体覆盖与未覆盖"
+        "的违规频率。width_hz 为正整数、max_windows 为 1～3（缺失、非整数或越界 → "
+        "422）；width_hz 超过扫描范围可容纳的整数 Hz 点数（scan_end_hz - "
+        "scan_start_hz + 1）→ 422；分析不存在 → 404。无违规产物时返回空窗口。"
+    ),
+)
+def get_scan_windows(
+    analysis_id: int,
+    width_hz: int = Query(..., gt=0, description="每个窗口覆盖的整数 Hz 点数，正整数"),
+    max_windows: int = Query(
+        ..., ge=1, le=3, description="允许的窗口数上限，取 1～3 的整数"
+    ),
+) -> ScanWindowsResult:
+    result = database.fetch_analysis(analysis_id)
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"analysis {analysis_id} not found")
+    site = database.fetch_site(result.site_id)
+    assert site is not None  # 外键约束：已保存分析必然属于现存站点
+    scan_size = site.scan_end_hz - site.scan_start_hz + 1
+    if width_hz > scan_size:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            f"width_hz {width_hz} exceeds scan range size {scan_size} Hz",
+        )
+    return build_scan_windows(
+        result=result,
+        scan_start_hz=site.scan_start_hz,
+        scan_end_hz=site.scan_end_hz,
+        width_hz=width_hz,
+        max_windows=max_windows,
+    )
 
 
 @app.post(
